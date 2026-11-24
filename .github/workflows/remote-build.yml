@@ -50,7 +50,6 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      repository: ${{ steps.resolve.outputs.repository }}
       owner: ${{ steps.resolve.outputs.owner }}
       owner_lower: ${{ steps.resolve.outputs.owner_lower }}
       pat_user: ${{ steps.resolve.outputs.pat_user }}
@@ -109,7 +108,6 @@ jobs:
               checkoutRef = rawRef;
               sourceRef = `refs/heads/${rawRef}`;
             }
-            core.setOutput('repository', `${owner}/${repo}`);
             core.setOutput('owner', owner);
             core.setOutput('owner_lower', owner.toLowerCase());
             core.setOutput('pat_user', patAccount.login);
@@ -117,7 +115,7 @@ jobs:
             core.setOutput('source_ref', sourceRef);
       - uses: actions/checkout@v4
         with:
-          repository: ${{ steps.resolve.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ steps.resolve.outputs.checkout_ref }}
           fetch-depth: 0
@@ -127,7 +125,7 @@ jobs:
       - id: compute
         uses: actions/github-script@v7
         env:
-          TARGET_REPOSITORY: ${{ steps.resolve.outputs.repository }}
+          TARGET_REPOSITORY: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           SOURCE_REF: ${{ steps.resolve.outputs.source_ref }}
           RELEASE_CHANNEL: ${{ inputs.channel }}
           DISTRIBUTE: ${{ inputs.distribute && (inputs.build_android || inputs.build_server) }}
@@ -144,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
@@ -173,7 +171,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
@@ -199,7 +197,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
@@ -241,7 +239,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
@@ -283,7 +281,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
@@ -358,7 +356,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ needs.prepare.outputs.repository }}
+          repository: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           token: ${{ secrets.TARGET_PAT }}
           ref: ${{ needs.prepare.outputs.sha }}
           persist-credentials: false
@@ -414,7 +412,7 @@ jobs:
         if: inputs.build_android && needs.prepare.outputs.publish == 'true'
         uses: actions/github-script@v7
         env:
-          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          TARGET_REPOSITORY: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           VERSION_RECORD: ${{ needs.prepare.outputs.record }}
           SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
         with:
@@ -462,7 +460,7 @@ jobs:
         if: needs.prepare.outputs.publish == 'true'
         uses: actions/github-script@v7
         env:
-          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          TARGET_REPOSITORY: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           RELEASE_CHANNEL: ${{ inputs.channel }}
           VERSION_NAME: ${{ needs.prepare.outputs.name }}
           VERSION_CODE: ${{ needs.prepare.outputs.code }}
@@ -480,7 +478,7 @@ jobs:
         if: steps.publish.outputs.published == 'true' && steps.publish.outputs.has_release == 'true'
         uses: actions/github-script@v7
         env:
-          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          TARGET_REPOSITORY: ${{ inputs.target_repo || secrets.TARGET_REPO || vars.TARGET_REPO }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           RELEASE_FILES: ${{ steps.publish.outputs.release_files }}
           HANDOFF_ARTIFACTS: '[]'
