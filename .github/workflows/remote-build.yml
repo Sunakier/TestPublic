@@ -390,7 +390,7 @@ jobs:
             echo "::error::缺少 KEYSTORE_BASE64，正式签名不可用。请在当前仓库 Settings → Secrets and variables → Actions 配置 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD。"
             exit 1
           fi
-          printf '%s' "$KEYSTORE_BASE64" | base64 -d > PaperWorld.jks
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > PaperWorld.jks
           {
             echo "KEYSTORE_FILE=PaperWorld.jks"
             echo "KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD}"
@@ -398,9 +398,14 @@ jobs:
             echo "KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
           } > keystore.properties
           ls -l PaperWorld.jks
-          expected="$(keytool -list -v -keystore PaperWorld.jks -storepass "$KEYSTORE_PASSWORD" \
-            -alias "${KEY_ALIAS:-PaperWorld}" 2>/dev/null \
-            | sed -n 's/^[[:space:]]*SHA256: //p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')"
+          if ! keytool_out="$(keytool -list -v -keystore PaperWorld.jks -storepass "$KEYSTORE_PASSWORD" \
+            -alias "${KEY_ALIAS:-PaperWorld}" 2>&1)"; then
+            echo "::error::keytool 读取 PaperWorld.jks 失败（请检查 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS）"
+            printf '%s\n' "$keytool_out"
+            exit 1
+          fi
+          expected="$(printf '%s\n' "$keytool_out" \
+            | sed -n 's/^[[:space:]]*SHA256: //p' | head -n 1 | tr -d ':' | tr 'A-F' 'a-f')"
           if [ -z "$expected" ]; then
             echo "::error::无法从 PaperWorld.jks 读出证书指纹，签名配置有问题"
             exit 1
