@@ -1,0 +1,491 @@
+name: Remote Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "目标私有仓库 owner/repo（留空则读取 Secrets/Variables 的 TARGET_REPO）"
+        required: false
+        default: ""
+      channel:
+        description: "发布渠道：preview（预览版）或 stable（正式版 vX.Y.Z 标签）"
+        type: choice
+        options:
+          - preview
+          - stable
+        default: preview
+      ref:
+        description: "要编译的分支、提交 SHA 或正式标签（preview 默认 master，stable 填如 v1.0.6）"
+        required: true
+        default: master
+      build_android:
+        description: "编译并发布 Android Release APK"
+        type: boolean
+        default: true
+      build_server:
+        description: "运行 Go 检查并构建服务端镜像 + Smoke 测试"
+        type: boolean
+        default: true
+      build_ddddocr:
+        description: "构建 ddddocr 侧车镜像（stable 且开启服务端时自动包含）"
+        type: boolean
+        default: false
+      build_bridge:
+        description: "验证构建 WakeUp / 超级课程表桥接变体"
+        type: boolean
+        default: false
+      distribute:
+        description: "分配 versionCode 并回推 Release / GHCR（关闭则仅编译验证）"
+        type: boolean
+        default: true
+
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+
+concurrency:
+  group: remote-build-${{ inputs.target_repo || 'default' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.resolve.outputs.repository }}
+      owner: ${{ steps.resolve.outputs.owner }}
+      owner_lower: ${{ steps.resolve.outputs.owner_lower }}
+      pat_user: ${{ steps.resolve.outputs.pat_user }}
+      name: ${{ steps.compute.outputs.name }}
+      code: ${{ steps.compute.outputs.code }}
+      sha: ${{ steps.compute.outputs.sha }}
+      tag: ${{ steps.compute.outputs.tag }}
+      record: ${{ steps.compute.outputs.record }}
+      publish: ${{ steps.compute.outputs.publish }}
+      build: ${{ steps.compute.outputs.build }}
+    steps:
+      - name: Validate PAT secret
+        env:
+          HAS_TARGET_PAT: ${{ secrets.TARGET_PAT != '' }}
+        run: |
+          if [ "$HAS_TARGET_PAT" != "true" ]; then
+            echo "::error::缺少 TARGET_PAT Secret，请在当前仓库 Settings → Secrets and variables → Actions 中配置。"
+            exit 1
+          fi
+      - name: Resolve target repository and PAT identity
+        id: resolve
+        uses: actions/github-script@v7
+        env:
+          INPUT_REPO: ${{ inputs.target_repo }}
+          SECRET_REPO: ${{ secrets.TARGET_REPO }}
+          VAR_REPO: ${{ vars.TARGET_REPO }}
+          INPUT_CHANNEL: ${{ inputs.channel }}
+          INPUT_REF: ${{ inputs.ref }}
+        with:
+          github-token: ${{ secrets.TARGET_PAT }}
+          script: |
+            const targetRepo = (process.env.INPUT_REPO || process.env.SECRET_REPO || process.env.VAR_REPO || '').trim();
+            const match = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/.exec(targetRepo);
+            if (!match) {
+              core.setFailed('未指定有效的目标仓库。请设置 TARGET_REPO Secret/Variable（格式 owner/repo）或在手动触发时填写 target_repo。');
+              return;
+            }
+            const [, owner, repo] = match;
+            const { data: patAccount } = await github.rest.users.getAuthenticated();
+            const { data: repoMeta } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoMeta.default_branch;
+            const rawRef = (process.env.INPUT_REF || '').trim() || defaultBranch;
+            let checkoutRef;
+            let sourceRef;
+            if (process.env.INPUT_CHANNEL === 'stable') {
+              const tag = rawRef.replace(/^refs\/tags\//, '');
+              checkoutRef = `refs/tags/${tag}`;
+              sourceRef = `refs/tags/${tag}`;
+            } else if (/^[a-f0-9]{40}$/i.test(rawRef)) {
+              checkoutRef = rawRef;
+              sourceRef = rawRef;
+            } else if (rawRef.startsWith('refs/')) {
+              checkoutRef = rawRef;
+              sourceRef = rawRef;
+            } else {
+              checkoutRef = rawRef;
+              sourceRef = `refs/heads/${rawRef}`;
+            }
+            core.setOutput('repository', `${owner}/${repo}`);
+            core.setOutput('owner', owner);
+            core.setOutput('owner_lower', owner.toLowerCase());
+            core.setOutput('pat_user', patAccount.login);
+            core.setOutput('checkout_ref', checkoutRef);
+            core.setOutput('source_ref', sourceRef);
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.resolve.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ steps.resolve.outputs.checkout_ref }}
+          fetch-depth: 0
+      - name: Fetch release tags
+        if: inputs.channel == 'stable'
+        run: git fetch --tags --force origin
+      - id: compute
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPOSITORY: ${{ steps.resolve.outputs.repository }}
+          SOURCE_REF: ${{ steps.resolve.outputs.source_ref }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          DISTRIBUTE: ${{ inputs.distribute && (inputs.build_android || inputs.build_server) }}
+        with:
+          github-token: ${{ secrets.TARGET_PAT }}
+          script: |
+            const allocate = require('./.github/scripts/allocate-version.cjs');
+            await allocate({ github, context, core });
+
+  server:
+    needs: prepare
+    if: inputs.build_server && needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: services/server/go.sum
+      - name: gofmt
+        working-directory: services/server
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+      - name: vet
+        working-directory: services/server
+        run: go vet ./...
+      - name: test
+        working-directory: services/server
+        run: go test ./...
+
+  bridge:
+    needs: prepare
+    if: inputs.build_bridge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;35.0.0"
+          accept-android-sdk-licenses: true
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build both bridge APKs
+        run: ./gradlew --stacktrace :shared:checkLocalization :course-bridge:assembleWakeupDebug :course-bridge:assembleSupercourseDebug
+
+  image_ddddocr:
+    name: image ddddocr
+    needs: prepare
+    if: (inputs.build_ddddocr || (inputs.channel == 'stable' && inputs.build_server)) && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ needs.prepare.outputs.pat_user }}
+          password: ${{ secrets.TARGET_PAT }}
+      - name: Reuse an existing immutable image
+        id: existing
+        env:
+          TARGET_OWNER: ${{ needs.prepare.outputs.owner }}
+          IMAGE_NAME: paperworld-ddddocr
+          VERSION_CODE: ${{ needs.prepare.outputs.code }}
+        run: bash .github/scripts/existing-image.sh
+      - uses: docker/build-push-action@v6
+        id: build
+        if: steps.existing.outputs.exists != 'true'
+        with:
+          context: ./services/server/ddddocr
+          push: true
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.name }}
+          tags: ghcr.io/${{ needs.prepare.outputs.owner_lower }}/paperworld-ddddocr:build-${{ needs.prepare.outputs.code }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.name }}
+          cache-from: type=gha,scope=ddddocr
+          cache-to: type=gha,mode=max,scope=ddddocr
+
+  image_server:
+    name: image server (all-in-one)
+    needs: prepare
+    if: inputs.build_server && needs.prepare.outputs.publish == 'true' && needs.prepare.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ needs.prepare.outputs.pat_user }}
+          password: ${{ secrets.TARGET_PAT }}
+      - name: Reuse an existing immutable image
+        id: existing
+        env:
+          TARGET_OWNER: ${{ needs.prepare.outputs.owner }}
+          IMAGE_NAME: paperworld-server
+          VERSION_CODE: ${{ needs.prepare.outputs.code }}
+        run: bash .github/scripts/existing-image.sh
+      - uses: docker/build-push-action@v6
+        id: build
+        if: steps.existing.outputs.exists != 'true'
+        with:
+          context: ./services/server
+          push: true
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.name }}
+          tags: ghcr.io/${{ needs.prepare.outputs.owner_lower }}/paperworld-server:build-${{ needs.prepare.outputs.code }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.name }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,mode=max,scope=server
+
+  image_smoke:
+    name: image smoke test (single container)
+    needs: [prepare, image_server]
+    if: |
+      always() && inputs.build_server && needs.prepare.outputs.build == 'true' &&
+      (needs.prepare.outputs.publish != 'true' || needs.image_server.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: needs.prepare.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ needs.prepare.outputs.pat_user }}
+          password: ${{ secrets.TARGET_PAT }}
+      - uses: docker/build-push-action@v6
+        if: needs.prepare.outputs.publish != 'true'
+        with:
+          context: ./services/server
+          push: false
+          load: true
+          tags: paperworld-server:smoke
+          build-args: |
+            VERSION=smoke-${{ needs.prepare.outputs.code }}
+          cache-from: type=gha,scope=server
+      - name: Pull the exact candidate image
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ needs.image_server.outputs.digest }}
+          OWNER_LOWER: ${{ needs.prepare.outputs.owner_lower }}
+        run: |
+          set -euo pipefail
+          test -n "$DIGEST"
+          image="ghcr.io/${OWNER_LOWER}/paperworld-server@$DIGEST"
+          docker pull "$image"
+          docker tag "$image" paperworld-server:smoke
+      - name: Run single container and probe both processes
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke \
+            -p 23677:23677 \
+            -e ADMIN_USER=admin -e ADMIN_PASSWORD=password123 \
+            paperworld-server:smoke
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:23677/healthz >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          echo "--- container logs ---"
+          docker logs smoke 2>&1 | tail -40
+          if [ "$ready" != 1 ]; then
+            echo "::error::服务端 120s 内未就绪"
+            exit 1
+          fi
+          echo "服务端 /healthz OK"
+
+          docker exec smoke /opt/ddddocr/.venv/bin/python -c "
+          import sys, urllib.request
+          with urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=15) as r:
+              print('sidecar /health', r.status, r.read().decode())
+              sys.exit(0 if r.status == 200 else 1)
+          "
+          echo "容器内侧车 /health OK"
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoke || true
+
+  android:
+    needs: [prepare, server, bridge, image_ddddocr, image_server, image_smoke]
+    if: |
+      always() && needs.prepare.result == 'success' && needs.prepare.outputs.build == 'true' &&
+      (inputs.build_android || needs.image_server.result == 'success' || needs.image_ddddocr.result == 'success') &&
+      (!inputs.build_server || needs.image_smoke.result == 'success') &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          token: ${{ secrets.TARGET_PAT }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Set up JDK 17
+        if: inputs.build_android
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Set up Android SDK
+        if: inputs.build_android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;35.0.0"
+          accept-android-sdk-licenses: true
+      - name: Materialize release signing config
+        if: inputs.build_android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ALLOW_DEBUG_SIGNING: ${{ inputs.channel == 'preview' && needs.prepare.outputs.publish != 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            if [ "${ALLOW_DEBUG_SIGNING:-}" = "true" ]; then
+              echo "::warning::未配置 KEYSTORE_BASE64，本次仅校验编译，退回 debug 签名"
+              exit 0
+            fi
+            echo "::error::缺少 KEYSTORE_BASE64，正式签名不可用。请在当前仓库 Settings → Secrets and variables → Actions 配置 KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD。"
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > PaperWorld.jks
+          {
+            echo "KEYSTORE_FILE=PaperWorld.jks"
+            echo "KEYSTORE_PASSWORD=${KEYSTORE_PASSWORD}"
+            echo "KEY_ALIAS=${KEY_ALIAS:-PaperWorld}"
+            echo "KEY_PASSWORD=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          } > keystore.properties
+          ls -l PaperWorld.jks
+          expected="$(keytool -list -v -keystore PaperWorld.jks -storepass "$KEYSTORE_PASSWORD" \
+            -alias "${KEY_ALIAS:-PaperWorld}" 2>/dev/null \
+            | sed -n 's/^[[:space:]]*SHA256: //p' | head -1 | tr -d ':' | tr 'A-F' 'a-f')"
+          if [ -z "$expected" ]; then
+            echo "::error::无法从 PaperWorld.jks 读出证书指纹，签名配置有问题"
+            exit 1
+          fi
+          echo "EXPECTED_CERT_SHA256=$expected" >> "$GITHUB_ENV"
+          echo "keystore 证书 SHA-256（期望值）: $expected"
+      - name: Restore APKs from a partially published release
+        id: restore
+        if: inputs.build_android && needs.prepare.outputs.publish == 'true'
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          VERSION_RECORD: ${{ needs.prepare.outputs.record }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        with:
+          github-token: ${{ secrets.TARGET_PAT }}
+          script: |
+            const restore = require('./.github/scripts/restore-release-apks.cjs');
+            await restore({ github, context, core });
+      - name: Set up Gradle
+        if: inputs.build_android && steps.restore.outputs.restored != 'true'
+        uses: gradle/actions/setup-gradle@v4
+      - name: Build release APKs
+        if: inputs.build_android && steps.restore.outputs.restored != 'true'
+        env:
+          VERSION_CODE: ${{ needs.prepare.outputs.code }}
+          VERSION_NAME: ${{ needs.prepare.outputs.name }}
+        run: |
+          set -euo pipefail
+          ./gradlew --stacktrace \
+            :shared:checkLocalization :app:checkLocalization :luori:checkLocalization \
+            :app:assembleRelease :luori:assembleRelease \
+            -PsplitApks=true \
+            -PversionCodeOverride="$VERSION_CODE" \
+            -PversionNameOverride="$VERSION_NAME"
+      - name: Collect + verify APKs
+        id: apks
+        if: inputs.build_android
+        uses: actions/github-script@v7
+        env:
+          APKS_RESTORED: ${{ steps.restore.outputs.restored }}
+          VERSION_NAME: ${{ needs.prepare.outputs.name }}
+          VERSION_CODE: ${{ needs.prepare.outputs.code }}
+          ALLOW_DEBUG_SIGNING: ${{ inputs.channel == 'preview' && needs.prepare.outputs.publish != 'true' }}
+        with:
+          script: require('./.github/scripts/release-apks.cjs').collectReleaseApks({ core });
+      - uses: docker/setup-buildx-action@v3
+        if: needs.prepare.outputs.publish == 'true' && (needs.image_server.result == 'success' || needs.image_ddddocr.result == 'success')
+      - uses: docker/login-action@v3
+        if: needs.prepare.outputs.publish == 'true' && (needs.image_server.result == 'success' || needs.image_ddddocr.result == 'success')
+        with:
+          registry: ghcr.io
+          username: ${{ needs.prepare.outputs.pat_user }}
+          password: ${{ secrets.TARGET_PAT }}
+      - name: Publish verified artifacts
+        id: publish
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          VERSION_NAME: ${{ needs.prepare.outputs.name }}
+          VERSION_CODE: ${{ needs.prepare.outputs.code }}
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION_RECORD: ${{ needs.prepare.outputs.record }}
+          PUBLISH_APKS: ${{ inputs.build_android }}
+          IMAGES_JSON: '{"paperworld-server":"${{ needs.image_server.outputs.digest }}","paperworld-ddddocr":"${{ needs.image_ddddocr.outputs.digest }}"}'
+        with:
+          github-token: ${{ secrets.TARGET_PAT }}
+          script: |
+            const publish = require('./.github/scripts/publish-release.cjs');
+            await publish({ github, context, core });
+      - name: Verify Release assets and retire superseded artifacts
+        if: steps.publish.outputs.published == 'true' && steps.publish.outputs.has_release == 'true'
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_FILES: ${{ steps.publish.outputs.release_files }}
+          HANDOFF_ARTIFACTS: '[]'
+        with:
+          github-token: ${{ secrets.TARGET_PAT }}
+          script: |
+            const retire = require('./.github/scripts/retire-release-artifacts.cjs');
+            await retire({ github, context, core });
